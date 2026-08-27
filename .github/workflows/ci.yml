@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# The runners are pods on Raspberry Pis. A superseded run is not worth the node
+# time.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  import-checks:
+    # The org-wide ARC scale set (homelab-infra apps/arc-runners-org, runner
+    # group "Raspberry Pi"). This label is that chart's runnerScaleSetName --
+    # the two must be changed together. The "Raspberry Pi" runner group must
+    # also grant this repo access.
+    runs-on: biwbass
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # MLX is Apple-silicon only and never installs on these arm64 Linux
+      # runners -- the same way hailo-detect's CI skips HailoRT. profiler.py and
+      # the other MLX entry points import mlx at module load and sys.exit with a
+      # clear message when it is missing; the checks below assert exactly that,
+      # and fully import everything that is designed to run without mlx.
+      - name: Install the non-MLX dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            psutil fastapi 'uvicorn[standard]' prometheus-client
+
+      - name: Byte-compile every module
+        run: python -m compileall -q *.py src
+
+      - name: Import the mlx-optional modules
+        run: |
+          python - <<'EOF'
+          import chart, macstat, mlxinfo, monitor, procmem
+          print("device_memory_info():", mlxinfo.device_memory_info())
+          print("mac_memory_stats():", macstat.mac_memory_stats())
+          print("mlx-optional modules import cleanly")
+          EOF
+
+      - name: Check profiler.py imports
+        run: |
+          python - <<'EOF'
+          # With mlx present the import fully resolves; without it (the normal
+          # case on these runners) profiler.py sys.exits with an mlx message.
+          # Either is a pass -- a different failure is not.
+          try:
+              import profiler
+          except SystemExit as exc:
+              assert "mlx" in str(exc).lower(), f"unexpected early exit: {exc!r}"
+              print(f"profiler.py exits cleanly when mlx is absent: {exc}")
+          else:
+              print("profiler.py imported fully (mlx available on this runner)")
+          EOF
