@@ -36,6 +36,18 @@ uv run profiler.py --model mlx-community/Qwen3.5-9B-6bit --port 8080
 
 Needs `pip install psutil` (`matplotlib` too if using `--plot`).
 
+## Development
+
+```bash
+uv sync --extra service --extra dev
+uv run pytest -q
+```
+
+CI (`.github/workflows/ci.yml`) runs the same on the homelab ARC runners.
+MLX is Apple-silicon only, so `profiler.py` imports with `mx = None` off a
+Mac and the model-server path is guarded in `main()` — the sampler maths,
+the metric wiring and the FastAPI endpoints are all still covered.
+
 ## Design choices and why
 
 **External monitor, not in-process, as the primary tool.** The model runs
