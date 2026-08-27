@@ -45,15 +45,18 @@ try:
 except ImportError:
     sys.exit("This script requires psutil: pip install psutil")
 
+# mlx / mlx-lm are Apple-silicon only. They're needed to actually run the
+# model server (checked in main()), but the metrics plumbing, the sampler
+# maths and the FastAPI app all import and test fine without them.
 try:
     import mlx.core as mx
 except ImportError:
-    sys.exit("This script requires mlx: pip install mlx-lm")
+    mx = None
 
 try:
     from mlx_lm import server as mlx_server
 except ImportError:
-    sys.exit("This script requires mlx-lm: pip install mlx-lm")
+    mlx_server = None
 
 try:
     import uvicorn
@@ -133,6 +136,19 @@ def _stat(*names):
     return None
 
 
+def _counter_delta(prev, value):
+    """How much to add to a Prometheus counter, given the previous and current
+    reading of a cumulative kernel counter. The first reading (prev is None)
+    contributes nothing — we adopt it as the baseline rather than emit the
+    machine's lifetime total. A drop means the kernel counter reset (reboot),
+    so the new value is itself the delta."""
+    if prev is None:
+        return 0
+    if value >= prev:
+        return value - prev
+    return value
+
+
 class Sampler:
     """Background loop: read every source once per interval, update metrics,
     and keep the latest reading around for the /api/snapshot endpoint."""
@@ -163,13 +179,7 @@ class Sampler:
             value = mac.get(key)
             if value is None:
                 continue
-            prev = self._page_prev.get(key)
-            if prev is None:
-                delta = 0  # first reading: adopt the baseline, don't emit the lifetime total
-            elif value >= prev:
-                delta = value - prev
-            else:
-                delta = value  # counter reset (reboot)
+            delta = _counter_delta(self._page_prev.get(key), value)
             if delta:
                 counter.inc(delta)
             self._page_prev[key] = value
@@ -289,13 +299,21 @@ def main():
 
     if args.help:
         print(__doc__)
-        print("\n--- mlx_lm.server flags (passed through) ---\n")
-        sys.argv = ["mlx_lm.server", "--help"]
-        try:
-            mlx_server.main()
-        except SystemExit:
-            pass
+        if mlx_server is not None:
+            print("\n--- mlx_lm.server flags (passed through) ---\n")
+            sys.argv = ["mlx_lm.server", "--help"]
+            try:
+                mlx_server.main()
+            except SystemExit:
+                pass
         return
+
+    if mx is None or mlx_server is None:
+        sys.exit(
+            "profiler.py needs mlx and mlx-lm to run the model server: "
+            "pip install mlx-lm  (or: uv sync --extra service). "
+            "MLX is Apple-silicon only."
+        )
 
     gpu_info = device_memory_info()
     if gpu_info:
