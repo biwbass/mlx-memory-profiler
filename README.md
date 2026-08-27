@@ -10,6 +10,8 @@ mini, how close to the ceiling am I actually getting?**
 | [`monitor.py`](monitor.py) | Watches a process from the *outside* (by PID, name match, or by launching a command). Works no matter how the model is served. Logs CSV, optional `--plot` PNG. |
 | [`serve.sh`](serve.sh) | Thin wrapper: launches `mlx_lm.server` under `monitor.py` so you don't have to remember the `-- python -m mlx_lm.server ...` syntax. |
 | [`serve_kv.py`](serve_kv.py) | Runs `mlx_lm.server` *in-process* (background thread) so it can poll MLX's own allocator counters directly — active/cache/peak memory, which includes weights + KV cache. Verified against a real model load, see Known Issues. |
+| [`profiler.py`](profiler.py) | Same in-process hosting as `serve_kv.py`, but exposes a live `/metrics` endpoint (Prometheus) plus `/healthz` and `/api/snapshot` instead of a CSV+PNG at the end. Drop-in wrapper — pass `mlx_lm.server` flags straight through. For an always-on homelab setup scraped by Prometheus/Grafana; see [`deploy/`](deploy/). Needs `uv sync --extra service`. |
+| [`macstat.py`](macstat.py) | Shared: full macOS memory picture from `vm_stat` + `sysctl` — Activity Monitor breakdown (wired/compressed/app/cached), memory-pressure level, paging counters. |
 | [`mlx_mem.py`](mlx_mem.py) | Import-and-use helper for a custom inference script you write yourself (not `mlx_lm.server`) — same MLX counters, wrapped as a context manager. |
 | `procmem.py` | Shared: process-tree memory reading (RSS vs. `footprint`). |
 | `mlxinfo.py` | Shared: reads `mx.device_info()` for the GPU/unified-memory ceiling. |
@@ -26,6 +28,10 @@ python monitor.py --plot -- python -m mlx_lm.server --model mlx-community/Qwen3.
 
 # Or the convenience wrapper (same thing, forwards flags to mlx_lm.server)
 ./serve.sh --model mlx-community/Qwen3.5-9B-6bit --port 8080
+
+# Always-on: serve the model AND expose Prometheus metrics on :9105
+uv sync --extra service
+uv run profiler.py --model mlx-community/Qwen3.5-9B-6bit --port 8080
 ```
 
 Needs `pip install psutil` (`matplotlib` too if using `--plot`).

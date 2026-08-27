@@ -1,0 +1,251 @@
+# Auto-loaded by the kube-prometheus-stack Grafana sidecar (watches all
+# namespaces for ConfigMaps labeled grafana_dashboard: "1").
+#
+# GitOps: copy into homelab-infra apps/kube-prometheus-stack-config/manifests/.
+# If you edit the dashboard, regenerate this file:
+#   deploy/k8s/gen-dashboard-configmap.sh
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-mlx-memory
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Homelab"
+data:
+  mlx-memory-dashboard.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "graphTooltip": 1,
+      "title": "MLX memory (Mac mini)",
+      "uid": "mlx-memory",
+      "tags": ["mlx", "homelab"],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "time": { "from": "now-3h", "to": "now" },
+      "refresh": "30s",
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": {},
+            "hide": 0
+          }
+        ]
+      },
+      "panels": [
+        {
+          "type": "stat",
+          "title": "MLX active (weights + KV)",
+          "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 18000000000 },
+                  { "color": "red", "value": 25000000000 }
+                ]
+              }
+            }
+          },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+          "targets": [
+            { "refId": "A", "expr": "mlx_active_memory_bytes", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "% of GPU working set",
+          "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "min": 0,
+              "max": 100,
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 75 },
+                  { "color": "red", "value": 90 }
+                ]
+              }
+            }
+          },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "100 * mlx_active_memory_bytes / mlx_gpu_recommended_working_set_bytes",
+              "datasource": { "type": "prometheus", "uid": "${datasource}" }
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Headroom to GPU working set",
+          "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "yellow", "value": 2000000000 },
+                  { "color": "green", "value": 6000000000 }
+                ]
+              }
+            }
+          },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "mlx_gpu_recommended_working_set_bytes - mlx_active_memory_bytes",
+              "datasource": { "type": "prometheus", "uid": "${datasource}" }
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Memory pressure",
+          "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "mappings": [
+                { "type": "value", "options": { "1": { "text": "Normal", "color": "green", "index": 0 } } },
+                { "type": "value", "options": { "2": { "text": "Warning", "color": "yellow", "index": 1 } } },
+                { "type": "value", "options": { "4": { "text": "Critical", "color": "red", "index": 2 } } }
+              ],
+              "color": { "mode": "thresholds" },
+              "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }
+            }
+          },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+          "targets": [
+            { "refId": "A", "expr": "macos_memory_pressure_level", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+          ]
+        },
+
+        {
+          "type": "timeseries",
+          "title": "MLX memory vs ceilings",
+          "gridPos": { "h": 9, "w": 12, "x": 0, "y": 6 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10, "showPoints": "never" } },
+            "overrides": [
+              { "matcher": { "id": "byName", "options": "GPU working set" }, "properties": [ { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } }, { "id": "custom.fillOpacity", "value": 0 } ] },
+              { "matcher": { "id": "byName", "options": "unified memory total" }, "properties": [ { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } }, { "id": "custom.fillOpacity", "value": 0 } ] }
+            ]
+          },
+          "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max"] }, "tooltip": { "mode": "multi" } },
+          "targets": [
+            { "refId": "A", "expr": "mlx_active_memory_bytes", "legendFormat": "active (weights + KV)", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "B", "expr": "mlx_cache_memory_bytes", "legendFormat": "allocator cache", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "C", "expr": "mlx_peak_memory_bytes", "legendFormat": "peak", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "D", "expr": "mlx_gpu_recommended_working_set_bytes", "legendFormat": "GPU working set", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "E", "expr": "mlx_gpu_total_memory_bytes", "legendFormat": "unified memory total", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Process footprint & system memory",
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 6 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10, "showPoints": "never" } },
+            "overrides": [
+              { "matcher": { "id": "byName", "options": "system total" }, "properties": [ { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } }, { "id": "custom.fillOpacity", "value": 0 } ] }
+            ]
+          },
+          "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max"] }, "tooltip": { "mode": "multi" } },
+          "targets": [
+            { "refId": "A", "expr": "mlx_process_memory_bytes", "legendFormat": "profiler process ({{source}})", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "B", "expr": "macos_system_memory_used_bytes", "legendFormat": "system used", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "C", "expr": "macos_system_memory_total_bytes", "legendFormat": "system total", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+          ]
+        },
+
+        {
+          "type": "timeseries",
+          "title": "macOS memory breakdown",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": { "unit": "bytes", "custom": { "fillOpacity": 40, "showPoints": "never", "stacking": { "mode": "normal", "group": "A" } } }
+          },
+          "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last"] }, "tooltip": { "mode": "multi" } },
+          "targets": [
+            { "refId": "A", "expr": "macos_memory_wired_bytes", "legendFormat": "wired", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "B", "expr": "macos_memory_compressed_bytes", "legendFormat": "compressed", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "C", "expr": "macos_memory_app_bytes", "legendFormat": "app", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "D", "expr": "macos_memory_cached_files_bytes", "legendFormat": "cached files", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "E", "expr": "macos_memory_free_bytes", "legendFormat": "free", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Paging activity",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": { "unit": "pages", "custom": { "fillOpacity": 10, "showPoints": "never" } }
+          },
+          "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max"] }, "tooltip": { "mode": "multi" } },
+          "targets": [
+            { "refId": "A", "expr": "rate(macos_vm_pageins_pages_total[5m])", "legendFormat": "pageins/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "B", "expr": "rate(macos_vm_pageouts_pages_total[5m])", "legendFormat": "pageouts/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "C", "expr": "rate(macos_vm_swapins_pages_total[5m])", "legendFormat": "swapins/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "D", "expr": "rate(macos_vm_swapouts_pages_total[5m])", "legendFormat": "swapouts/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "E", "expr": "rate(macos_vm_compressions_pages_total[5m])", "legendFormat": "compressions/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+            { "refId": "F", "expr": "rate(macos_vm_decompressions_pages_total[5m])", "legendFormat": "decompressions/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+          ]
+        },
+
+        {
+          "type": "timeseries",
+          "title": "Swap used",
+          "gridPos": { "h": 6, "w": 12, "x": 0, "y": 23 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "fillOpacity": 15, "showPoints": "never" } } },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+          "targets": [
+            { "refId": "A", "expr": "macos_swap_used_bytes", "legendFormat": "swap used", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "System memory used %",
+          "gridPos": { "h": 6, "w": 12, "x": 12, "y": 23 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent", "min": 0, "max": 100,
+              "custom": { "fillOpacity": 15, "showPoints": "never", "thresholdsStyle": { "mode": "line" } },
+              "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 85 }, { "color": "red", "value": 95 } ] }
+            }
+          },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+          "targets": [
+            { "refId": "A", "expr": "macos_system_memory_used_percent", "legendFormat": "system used %", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+          ]
+        }
+      ]
+    }

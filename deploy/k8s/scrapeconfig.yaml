@@ -1,0 +1,29 @@
+# Scrapes profiler.py running on the Mac mini (outside the cluster).
+#
+# GitOps: copy into homelab-infra apps/kube-prometheus-stack-config/manifests/
+# so the kube-prometheus-stack-config ArgoCD app applies it to the monitoring
+# namespace.
+#
+# The `release` label is how the prometheus-operator selects ScrapeConfigs
+# (scrapeConfigSelectorNilUsesHelmValues defaults to true). Confirm the value
+# matches the kube-prometheus-stack Helm release name:
+#   kubectl get prometheus -n monitoring -o jsonpath='{.items[0].spec.scrapeConfigSelector}'
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: mlx-profiler
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  scrapeInterval: 15s
+  scrapeTimeout: 10s
+  metricsPath: /metrics
+  staticConfigs:
+    - targets:
+        # Mac mini LAN address / DNS name + profiler.py --metrics-port
+        - mac-mini.lan:9105
+      labels:
+        host: mac-mini
+        job: mlx-profiler
