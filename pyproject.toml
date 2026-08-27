@@ -13,6 +13,14 @@ dependencies = [
     "psutil>=7.2.2",
 ]
 
+[project.optional-dependencies]
+# Needed only for profiler.py (the mlx_lm.server wrapper + /metrics endpoint).
+service = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "prometheus-client>=0.21",
+]
+
 [project.scripts]
 mlx-memory-profiler = "mlx_memory_profiler:main"
 
