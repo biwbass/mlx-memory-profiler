@@ -47,6 +47,34 @@ curl -s localhost:9105/api/snapshot | python3 -m json.tool
 `--metrics-host 0.0.0.0` is required for the cluster to reach it. Consider a
 firewall rule / LAN-only exposure — `mlx_lm.server` itself has minimal auth.
 
+### Bearer-token auth on the metrics endpoint
+
+Defence-in-depth alongside the LAN firewall rule / cluster NetworkPolicy. Set
+`MLX_PROFILER_METRICS_TOKEN` (or pass `--metrics-token`) and `/metrics` and
+`/api/snapshot` require `Authorization: Bearer <token>`; `/healthz` stays open
+so k8s probes still work.
+
+```bash
+# generate once, keep it out of shell history / `ps` output
+openssl rand -hex 32 > ~/.mlx-profiler-token
+launchctl setenv MLX_PROFILER_METRICS_TOKEN "$(cat ~/.mlx-profiler-token)"
+
+curl -s -H "Authorization: Bearer $(cat ~/.mlx-profiler-token)" localhost:9105/metrics | grep mlx_gpu
+curl -s localhost:9105/metrics            # -> 401
+```
+
+For the launchd agent, add it to the plist's `EnvironmentVariables` dict rather
+than `ProgramArguments` (keeps it off the process command line):
+
+```xml
+<key>MLX_PROFILER_METRICS_TOKEN</key>
+<string>…64 hex chars…</string>
+```
+
+Cluster side (issue #71): store the same value as a Secret and reference it from
+the `ScrapeConfig` / `ServiceMonitor` — `authorization.credentials` (bearer) or
+the older `bearerTokenSecret`. See [`k8s/scrapeconfig.yaml`](k8s/scrapeconfig.yaml).
+
 ## 2. k8s — scrape + dashboard
 
 Both manifests target the `monitoring` namespace and are labelled for the

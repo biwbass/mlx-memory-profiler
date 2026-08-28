@@ -25,6 +25,12 @@ Usage:
     # tune the sampler / move the metrics port:
     python profiler.py --model ... --metrics-port 9105 --sample-interval 2
 
+    # require a bearer token on /metrics and /api/snapshot (defence-in-depth
+    # alongside a LAN-only firewall rule / cluster NetworkPolicy):
+    MLX_PROFILER_METRICS_TOKEN=$(openssl rand -hex 32) python profiler.py --model ...
+    #   Prometheus side: ServiceMonitor / ScrapeConfig `authorization` (bearer)
+    #   or the older `bearerTokenSecret`. /healthz stays open for k8s probes.
+
 Requires: pip install psutil mlx-lm fastapi "uvicorn[standard]" prometheus-client
 
 Caveat (inherited from serve_kv.py): relies on `mlx_lm.server.main()` reading
@@ -34,6 +40,7 @@ guaranteed public API.
 import argparse
 import atexit
 import os
+import secrets
 import sys
 import tempfile
 import threading
@@ -60,7 +67,7 @@ except ImportError:
 
 try:
     import uvicorn
-    from fastapi import FastAPI
+    from fastapi import Depends, FastAPI, Header, HTTPException
     from fastapi.responses import JSONResponse, Response
     from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
 except ImportError:
@@ -74,6 +81,10 @@ from mlxinfo import device_memory_info
 from procmem import HAVE_FOOTPRINT, tree_footprint_bytes, tree_procs, tree_rss_bytes
 
 GB = 1024 ** 3
+
+# Bearer token for /metrics and /api/snapshot. CLI flag wins; this is the
+# fallback so the launchd plist / k8s can inject it without it showing in `ps`.
+TOKEN_ENV = "MLX_PROFILER_METRICS_TOKEN"
 
 # --- metrics ---------------------------------------------------------------
 
@@ -256,10 +267,36 @@ class Sampler:
         self._stop.set()
 
 
-def build_app(sampler, server_thread):
+def _auth_dependency(token):
+    """A FastAPI dependency that enforces `Authorization: Bearer <token>`.
+    Returns None when no token is configured, so the endpoints stay open."""
+    if not token:
+        return None
+
+    def require_bearer_token(authorization: str = Header(default="")):
+        scheme, _, presented = authorization.partition(" ")
+        # compare_digest keeps the check constant-time; encode so a non-ASCII
+        # header can't raise instead of just failing.
+        ok = scheme.lower() == "bearer" and secrets.compare_digest(
+            presented.encode(), token.encode()
+        )
+        if not ok:
+            raise HTTPException(
+                status_code=401,
+                detail="missing or invalid bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    return require_bearer_token
+
+
+def build_app(sampler, server_thread, token=None):
     app = FastAPI(title="mlx-memory-profiler", docs_url=None, redoc_url=None)
 
-    @app.get("/metrics")
+    guard = _auth_dependency(token)
+    protected = [Depends(guard)] if guard is not None else []
+
+    @app.get("/metrics", dependencies=protected)
     def metrics():
         _server_up.set(1 if server_thread.is_alive() else 0)
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
@@ -279,7 +316,7 @@ def build_app(sampler, server_thread):
             },
         )
 
-    @app.get("/api/snapshot")
+    @app.get("/api/snapshot", dependencies=protected)
     def snapshot():
         if not sampler.latest:
             return JSONResponse(status_code=503, content={"detail": "no sample yet"})
@@ -294,6 +331,14 @@ def main():
     parser.add_argument("--metrics-port", type=int, default=9105, help="Port for the metrics endpoint (default: 9105)")
     parser.add_argument("--sample-interval", type=float, default=2.0, help="Seconds between metric samples (default: 2.0)")
     parser.add_argument("--no-footprint", action="store_true", help="Use RSS instead of the `footprint` tool")
+    parser.add_argument(
+        "--metrics-token",
+        default=os.environ.get(TOKEN_ENV),
+        help=(
+            "Require 'Authorization: Bearer <token>' on /metrics and /api/snapshot "
+            f"(default: ${TOKEN_ENV}; /healthz stays open for k8s probes)"
+        ),
+    )
     parser.add_argument("-h", "--help", action="store_true", help="Show this help and mlx_lm.server's help")
     args, server_args = parser.parse_known_args()
 
@@ -338,8 +383,12 @@ def main():
     sampler_thread = threading.Thread(target=sampler.run, name="sampler", daemon=True)
     sampler_thread.start()
 
-    app = build_app(sampler, server_thread)
-    print(f"metrics: http://{args.metrics_host}:{args.metrics_port}/metrics  (model server flags -> mlx_lm.server)")
+    app = build_app(sampler, server_thread, token=args.metrics_token)
+    auth_note = "bearer-token auth on" if args.metrics_token else "no auth — keep it LAN-only"
+    print(
+        f"metrics: http://{args.metrics_host}:{args.metrics_port}/metrics  "
+        f"({auth_note}; model server flags -> mlx_lm.server)"
+    )
     try:
         uvicorn.run(app, host=args.metrics_host, port=args.metrics_port, log_level="warning")
     finally:

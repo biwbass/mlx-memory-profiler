@@ -95,6 +95,37 @@ def test_healthz_503_when_model_server_thread_is_dead():
     assert client.get("/healthz").status_code == 503
 
 
+# --- bearer-token auth -------------------------------------------------
+
+def test_no_token_leaves_endpoints_open():
+    sampler = profiler.Sampler(interval=1, use_footprint=False)
+    sampler.sample_once()
+    client = TestClient(profiler.build_app(sampler, FakeThread()))
+    assert client.get("/metrics").status_code == 200
+    assert client.get("/api/snapshot").status_code == 200
+
+
+def test_token_required_on_metrics_and_snapshot():
+    sampler = profiler.Sampler(interval=1, use_footprint=False)
+    sampler.sample_once()
+    client = TestClient(profiler.build_app(sampler, FakeThread(), token="s3cret"))
+
+    assert client.get("/metrics").status_code == 401
+    assert client.get("/api/snapshot").status_code == 401
+    assert client.get("/metrics", headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+    ok = {"Authorization": "Bearer s3cret"}
+    assert client.get("/metrics", headers=ok).status_code == 200
+    assert client.get("/api/snapshot", headers=ok).status_code == 200
+
+
+def test_healthz_stays_open_with_a_token_set():
+    sampler = profiler.Sampler(interval=1, use_footprint=False)
+    sampler.sample_once()
+    client = TestClient(profiler.build_app(sampler, FakeThread(), token="s3cret"))
+    assert client.get("/healthz").status_code == 200
+
+
 def test_sample_once_records_a_timestamp():
     sampler = profiler.Sampler(interval=1, use_footprint=False)
     assert sampler.last_sample_ts == 0.0
