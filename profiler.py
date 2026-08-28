@@ -1,69 +1,62 @@
 #!/usr/bin/env python3
 """
-Run `mlx_lm.server` with a Prometheus metrics endpoint bolted on.
+Supervise an OpenAI-compatible MLX model server and expose Prometheus metrics.
 
-This is a drop-in wrapper: pass `mlx_lm.server`'s own flags straight through
-and it serves the model exactly as before, on the same port. Alongside it,
-this process also runs a small FastAPI app that exposes `/metrics` in
-Prometheus exposition format, so a Prometheus server (e.g. on a k8s cluster
-that can reach this Mac over the LAN) can scrape live memory usage and a
-Grafana dashboard can graph it.
+`profiler.py` launches the model server you give it (everything after `--`)
+as a child process, then runs a small FastAPI app that exposes `/metrics` in
+Prometheus exposition format plus `/healthz` and `/api/snapshot`. A Prometheus
+server (e.g. on a k8s cluster that can reach this Mac over the LAN) scrapes
+`/metrics`; a Grafana dashboard graphs it. See `deploy/`.
 
-Like serve_kv.py, `mlx_lm.server` is loaded as a module and run in a
-background thread of *this* process, so the sampler can read MLX's own
-allocator counters (active / cache / peak memory) directly. It also samples
-the process-tree footprint (procmem.py) and the full macOS memory picture —
-Activity Monitor breakdown, memory pressure, paging counters (macstat.py).
+    python profiler.py -- mlx-openai-server launch \
+        --model-path mlx-community/Qwen3.5-9B-6bit --port 8080
 
-Usage:
-
-    python profiler.py --model mlx-community/Qwen3.5-9B-6bit --port 8080
-
-    # model server -> :8080 (unchanged, OpenAI-compatible)
+    # model server -> :8080 (OpenAI-compatible, unchanged)
     # metrics      -> :9105/metrics
 
-    # tune the sampler / move the metrics port:
-    python profiler.py --model ... --metrics-port 9105 --sample-interval 2
+    # tune the sampler / move the metrics port / require a bearer token:
+    MLX_PROFILER_METRICS_TOKEN=$(openssl rand -hex 32) \
+        python profiler.py --metrics-port 9105 --sample-interval 2 -- \
+        mlx-openai-server launch --model-path ... --port 8080
 
-    # require a bearer token on /metrics and /api/snapshot (defence-in-depth
-    # alongside a LAN-only firewall rule / cluster NetworkPolicy):
-    MLX_PROFILER_METRICS_TOKEN=$(openssl rand -hex 32) python profiler.py --model ...
-    #   Prometheus side: ServiceMonitor / ScrapeConfig `authorization` (bearer)
-    #   or the older `bearerTokenSecret`. /healthz stays open for k8s probes.
+What the sampler reads every interval:
 
-Requires: pip install psutil mlx-lm fastapi "uvicorn[standard]" prometheus-client
+  * The child's whole process tree — phys_footprint via `footprint` (the
+    number Activity Monitor shows), else RSS (procmem.py). `mlx-openai-server`
+    loads the model in a *spawned subprocess*, so the tree walk is what
+    captures the model's real memory.
+  * The full macOS memory picture — Activity Monitor breakdown, memory
+    pressure, paging counters (macstat.py).
+  * MLX allocator counters (active / cache / peak) — scraped over HTTP from
+    the model server's `/v1/internal/memory` endpoint, because those counters
+    are per-process and only meaningful inside the process that holds the
+    model. Needs a server build that exposes that endpoint; when it's absent
+    or unreachable the `mlx_*_memory_bytes` gauges are simply not emitted
+    (like off Apple Silicon) and `mlx_profiler_mlx_memory_up` reads 0.
 
-Caveat (inherited from serve_kv.py): relies on `mlx_lm.server.main()` reading
-sys.argv, which holds for the mlx-lm versions this targets but isn't a
-guaranteed public API.
+Requires: pip install psutil fastapi "uvicorn[standard]" prometheus-client
+(`uv sync --extra service`). The model server itself is whatever you pass
+after `--`; it is not imported here.
 """
 import argparse
 import atexit
+import json
 import os
 import secrets
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 try:
     import psutil
 except ImportError:
     sys.exit("This script requires psutil: pip install psutil")
-
-# mlx / mlx-lm are Apple-silicon only. They're needed to actually run the
-# model server (checked in main()), but the metrics plumbing, the sampler
-# maths and the FastAPI app all import and test fine without them.
-try:
-    import mlx.core as mx
-except ImportError:
-    mx = None
-
-try:
-    from mlx_lm import server as mlx_server
-except ImportError:
-    mlx_server = None
 
 try:
     import uvicorn
@@ -86,21 +79,28 @@ GB = 1024 ** 3
 # fallback so the launchd plist / k8s can inject it without it showing in `ps`.
 TOKEN_ENV = "MLX_PROFILER_METRICS_TOKEN"
 
+# Path on the model server that reports its MLX allocator counters as JSON
+# ({"active_bytes", "cache_bytes", "peak_bytes"} — a nested "memory" object
+# with the same keys is also accepted).
+DEFAULT_MLX_MEMORY_PATH = "/v1/internal/memory"
+
 # --- metrics ---------------------------------------------------------------
 
-# MLX allocator counters (weights + KV cache together; see serve_kv.py notes).
+# MLX allocator counters (weights + KV cache together — MLX has no public API
+# to split them). Scraped from the model server; see module docstring.
 _mlx_active = Gauge("mlx_active_memory_bytes", "MLX active memory: model weights + KV cache")
 _mlx_cache = Gauge("mlx_cache_memory_bytes", "MLX allocator cache (freed buffers held for reuse)")
-_mlx_peak = Gauge("mlx_peak_memory_bytes", "MLX peak active memory since process start")
+_mlx_peak = Gauge("mlx_peak_memory_bytes", "MLX peak active memory since the model server started")
 
-# This process' tree, via `footprint` (phys_footprint) when available, else RSS.
-_proc_mem = Gauge("mlx_process_memory_bytes", "Profiler process-tree memory", ["source"])
+# The supervised server's process tree, via `footprint` (phys_footprint) when
+# available, else RSS. Includes mlx-openai-server's spawned model subprocess.
+_proc_mem = Gauge("mlx_process_memory_bytes", "Model-server process-tree memory", ["source"])
 
 # Static ceilings from mx.device_info() (see mlxinfo.py).
 _gpu_total = Gauge("mlx_gpu_total_memory_bytes", "Total unified memory on this machine")
 _gpu_working_set = Gauge(
     "mlx_gpu_recommended_working_set_bytes",
-    "Apple's recommended GPU working-set ceiling (mlx_lm.server's wired limit)",
+    "Apple's recommended GPU working-set ceiling (the wired limit MLX servers set)",
 )
 
 # System memory, psutil headline numbers.
@@ -134,17 +134,14 @@ _PAGE_COUNTERS = {
 
 # Health / liveness.
 _up = Gauge("mlx_profiler_up", "1 while the profiler process is running")
-_server_up = Gauge("mlx_profiler_model_server_up", "1 while the mlx_lm.server thread is alive")
+_server_up = Gauge("mlx_profiler_model_server_up", "1 while the supervised model-server process is alive")
+_mlx_mem_up = Gauge("mlx_profiler_mlx_memory_up", "1 when the model server's MLX memory endpoint was last scraped OK")
 _last_sample = Gauge("mlx_profiler_last_sample_timestamp_seconds", "Unix time of the last successful sample")
 _sample_errors = Counter("mlx_profiler_sample_errors_total", "Sampler iterations that raised")
-
-
-def _stat(*names):
-    for name in names:
-        fn = getattr(mx, name, None) or getattr(getattr(mx, "metal", None), name, None)
-        if fn is not None:
-            return fn()
-    return None
+_mlx_mem_errors = Counter(
+    "mlx_profiler_mlx_memory_scrape_errors_total",
+    "Failed scrapes of the model server's MLX memory endpoint",
+)
 
 
 def _counter_delta(prev, value):
@@ -160,14 +157,57 @@ def _counter_delta(prev, value):
     return value
 
 
+def scrape_mlx_memory(url, timeout=1.5):
+    """GET `url` and pull MLX allocator counters out of the JSON body. Returns
+    a dict with int `active`/`cache`/`peak` (any missing key omitted), or None
+    if the request failed or the body wasn't usable. Never raises."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 (operator-supplied localhost URL)
+            payload = json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return None
+
+    body = payload.get("memory", payload) if isinstance(payload, dict) else None
+    if not isinstance(body, dict):
+        return None
+
+    out = {}
+    for short, keys in (
+        ("active", ("active_bytes", "active", "active_memory")),
+        ("cache", ("cache_bytes", "cache", "cache_memory")),
+        ("peak", ("peak_bytes", "peak", "peak_memory")),
+    ):
+        for key in keys:
+            if isinstance(body.get(key), (int, float)):
+                out[short] = int(body[key])
+                break
+    return out or None
+
+
+def _server_alive(server):
+    """True if the supervised server handle looks alive. Accepts a Popen
+    (`.poll()`), a thread-like (`.is_alive()`), or None (treated as alive so
+    the endpoints are testable without a real child)."""
+    if server is None:
+        return True
+    if hasattr(server, "poll"):
+        return server.poll() is None
+    if hasattr(server, "is_alive"):
+        return server.is_alive()
+    return True
+
+
 class Sampler:
     """Background loop: read every source once per interval, update metrics,
     and keep the latest reading around for the /api/snapshot endpoint."""
 
-    def __init__(self, interval, use_footprint):
+    def __init__(self, interval, use_footprint, target_pid=None, mlx_memory_url=None):
         self.interval = interval
         self.use_footprint = use_footprint
-        self.proc = psutil.Process()
+        self.mlx_memory_url = mlx_memory_url
+        # The process to walk. Defaults to this process (handy for tests);
+        # main() points it at the supervised model server.
+        self.proc = psutil.Process(target_pid) if target_pid else psutil.Process()
         self.latest = {}
         self.last_sample_ts = 0.0
         self._page_prev = {}
@@ -195,13 +235,27 @@ class Sampler:
                 counter.inc(delta)
             self._page_prev[key] = value
 
+    def _sample_mlx_memory(self):
+        """Scrape the model server's MLX counters. Returns the dict from
+        scrape_mlx_memory (or None) and updates the related metrics."""
+        if not self.mlx_memory_url:
+            return None
+        mem = scrape_mlx_memory(self.mlx_memory_url)
+        if mem is None:
+            _mlx_mem_errors.inc()
+            _mlx_mem_up.set(0)
+            return None
+        if "active" in mem:
+            _mlx_active.set(mem["active"])
+        if "cache" in mem:
+            _mlx_cache.set(mem["cache"])
+        if "peak" in mem:
+            _mlx_peak.set(mem["peak"])
+        _mlx_mem_up.set(1)
+        return mem
+
     def sample_once(self):
-        active = _stat("get_active_memory") or 0
-        cache = _stat("get_cache_memory") or 0
-        peak = _stat("get_peak_memory") or 0
-        _mlx_active.set(active)
-        _mlx_cache.set(cache)
-        _mlx_peak.set(peak)
+        mlx_mem = self._sample_mlx_memory()
 
         procs = tree_procs(self.proc)
         proc_bytes = tree_footprint_bytes(procs, self._fp_tmp) if self.use_footprint else None
@@ -236,14 +290,20 @@ class Sampler:
         now = time.time()
         _last_sample.set(now)
         self.last_sample_ts = now
+        if mlx_mem is not None:
+            active = mlx_mem.get("active")
+            mlx_block = {
+                "available": True,
+                "active_bytes": active,
+                "cache_bytes": mlx_mem.get("cache"),
+                "peak_bytes": mlx_mem.get("peak"),
+                "active_gb": round(active / GB, 3) if active is not None else None,
+            }
+        else:
+            mlx_block = {"available": False}
         self.latest = {
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "mlx": {
-                "active_bytes": active,
-                "cache_bytes": cache,
-                "peak_bytes": peak,
-                "active_gb": round(active / GB, 3),
-            },
+            "mlx": mlx_block,
             "process": {"memory_bytes": proc_bytes, "source": source},
             "system": {
                 "total_bytes": vm.total,
@@ -290,7 +350,7 @@ def _auth_dependency(token):
     return require_bearer_token
 
 
-def build_app(sampler, server_thread, token=None):
+def build_app(sampler, server, token=None):
     app = FastAPI(title="mlx-memory-profiler", docs_url=None, redoc_url=None)
 
     guard = _auth_dependency(token)
@@ -298,12 +358,12 @@ def build_app(sampler, server_thread, token=None):
 
     @app.get("/metrics", dependencies=protected)
     def metrics():
-        _server_up.set(1 if server_thread.is_alive() else 0)
+        _server_up.set(1 if _server_alive(server) else 0)
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/healthz")
     def healthz():
-        alive = server_thread.is_alive()
+        alive = _server_alive(server)
         last = sampler.last_sample_ts
         age = time.time() - last if last else None
         healthy = alive and age is not None and age < max(30, sampler.interval * 5)
@@ -325,12 +385,62 @@ def build_app(sampler, server_thread, token=None):
     return app
 
 
+def _derive_server_url(explicit, server_cmd):
+    """Where to reach the model server for scraping. Uses --server-url if
+    given, else reads --host/--port out of the server command (0.0.0.0 ->
+    127.0.0.1), else defaults to http://127.0.0.1:8000."""
+    if explicit:
+        return explicit.rstrip("/")
+    host, port = "127.0.0.1", "8000"
+    for i, tok in enumerate(server_cmd):
+        for flag, setter in (("--host", "host"), ("--port", "port")):
+            if tok == flag and i + 1 < len(server_cmd):
+                val = server_cmd[i + 1]
+            elif tok.startswith(flag + "="):
+                val = tok.split("=", 1)[1]
+            else:
+                continue
+            if setter == "host":
+                host = val
+            else:
+                port = val
+    if host in ("0.0.0.0", "::", ""):
+        host = "127.0.0.1"
+    return f"http://{host}:{port}"
+
+
+def _terminate(proc, timeout=10):
+    """SIGTERM the child, then SIGKILL if it doesn't go."""
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--metrics-host", default="0.0.0.0", help="Bind host for the metrics endpoint (default: 0.0.0.0)")
     parser.add_argument("--metrics-port", type=int, default=9105, help="Port for the metrics endpoint (default: 9105)")
     parser.add_argument("--sample-interval", type=float, default=2.0, help="Seconds between metric samples (default: 2.0)")
     parser.add_argument("--no-footprint", action="store_true", help="Use RSS instead of the `footprint` tool")
+    parser.add_argument(
+        "--server-url",
+        default=None,
+        help="Base URL to reach the model server for scraping (default: derived from its --host/--port, else http://127.0.0.1:8000)",
+    )
+    parser.add_argument(
+        "--mlx-memory-path",
+        default=DEFAULT_MLX_MEMORY_PATH,
+        help=f"Path on the model server that reports MLX allocator counters (default: {DEFAULT_MLX_MEMORY_PATH})",
+    )
+    parser.add_argument(
+        "--no-mlx-memory",
+        action="store_true",
+        help="Don't scrape the model server for MLX counters (the mlx_*_memory_bytes gauges won't be emitted)",
+    )
     parser.add_argument(
         "--metrics-token",
         default=os.environ.get(TOKEN_ENV),
@@ -339,25 +449,20 @@ def main():
             f"(default: ${TOKEN_ENV}; /healthz stays open for k8s probes)"
         ),
     )
-    parser.add_argument("-h", "--help", action="store_true", help="Show this help and mlx_lm.server's help")
-    args, server_args = parser.parse_known_args()
+    parser.add_argument("-h", "--help", action="store_true", help="Show this help")
+    args, server_cmd = parser.parse_known_args()
+
+    if server_cmd and server_cmd[0] == "--":
+        server_cmd = server_cmd[1:]
 
     if args.help:
         print(__doc__)
-        if mlx_server is not None:
-            print("\n--- mlx_lm.server flags (passed through) ---\n")
-            sys.argv = ["mlx_lm.server", "--help"]
-            try:
-                mlx_server.main()
-            except SystemExit:
-                pass
         return
-
-    if mx is None or mlx_server is None:
+    if not server_cmd:
         sys.exit(
-            "profiler.py needs mlx and mlx-lm to run the model server: "
-            "pip install mlx-lm  (or: uv sync --extra service). "
-            "MLX is Apple-silicon only."
+            "error: no model-server command given. Put it after `--`, e.g.\n"
+            "  python profiler.py -- mlx-openai-server launch --model-path <repo> --port 8080\n"
+            "(--help for details)"
         )
 
     gpu_info = device_memory_info()
@@ -373,27 +478,45 @@ def main():
     if not use_footprint and not args.no_footprint:
         print("Note: `footprint` not found (xcode-select --install for accurate Apple Silicon numbers); using RSS.")
 
+    mlx_memory_url = None
+    if not args.no_mlx_memory:
+        mlx_memory_url = _derive_server_url(args.server_url, server_cmd) + args.mlx_memory_path
+
     _up.set(1)
 
-    sys.argv = ["mlx_lm.server"] + server_args
-    server_thread = threading.Thread(target=mlx_server.main, name="mlx_lm.server", daemon=True)
-    server_thread.start()
+    print(f"launching model server: {' '.join(server_cmd)}")
+    proc = subprocess.Popen(server_cmd)  # noqa: S603 (operator-supplied command)
 
-    sampler = Sampler(args.sample_interval, use_footprint)
+    sampler = Sampler(
+        args.sample_interval, use_footprint,
+        target_pid=proc.pid, mlx_memory_url=mlx_memory_url,
+    )
     sampler_thread = threading.Thread(target=sampler.run, name="sampler", daemon=True)
     sampler_thread.start()
 
-    app = build_app(sampler, server_thread, token=args.metrics_token)
+    # If the model server dies, take the profiler down with it so launchd /
+    # the k8s scrape target flips unhealthy and the pair gets restarted.
+    def _watch_child():
+        proc.wait()
+        print(f"model server exited (code {proc.returncode}); shutting down", file=sys.stderr)
+        _server_up.set(0)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=_watch_child, name="child-watch", daemon=True).start()
+
+    app = build_app(sampler, proc, token=args.metrics_token)
     auth_note = "bearer-token auth on" if args.metrics_token else "no auth — keep it LAN-only"
+    mem_note = mlx_memory_url or "disabled"
     print(
         f"metrics: http://{args.metrics_host}:{args.metrics_port}/metrics  "
-        f"({auth_note}; model server flags -> mlx_lm.server)"
+        f"({auth_note}; MLX counters <- {mem_note})"
     )
     try:
         uvicorn.run(app, host=args.metrics_host, port=args.metrics_port, log_level="warning")
     finally:
         sampler.stop()
         _up.set(0)
+        _terminate(proc)
 
 
 if __name__ == "__main__":

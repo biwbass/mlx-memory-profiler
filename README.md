@@ -10,7 +10,7 @@ mini, how close to the ceiling am I actually getting?**
 | [`monitor.py`](monitor.py) | Watches a process from the *outside* (by PID, name match, or by launching a command). Works no matter how the model is served. Logs CSV, optional `--plot` PNG. |
 | [`serve.sh`](serve.sh) | Thin wrapper: launches `mlx_lm.server` under `monitor.py` so you don't have to remember the `-- python -m mlx_lm.server ...` syntax. |
 | [`serve_kv.py`](serve_kv.py) | Runs `mlx_lm.server` *in-process* (background thread) so it can poll MLX's own allocator counters directly — active/cache/peak memory, which includes weights + KV cache. Verified against a real model load, see Known Issues. |
-| [`profiler.py`](profiler.py) | Same in-process hosting as `serve_kv.py`, but exposes a live `/metrics` endpoint (Prometheus) plus `/healthz` and `/api/snapshot` instead of a CSV+PNG at the end. Drop-in wrapper — pass `mlx_lm.server` flags straight through. Optional bearer-token auth on `/metrics` + `/api/snapshot` via `MLX_PROFILER_METRICS_TOKEN` / `--metrics-token`. For an always-on homelab setup scraped by Prometheus/Grafana; see [`deploy/`](deploy/). Needs `uv sync --extra service`. |
+| [`profiler.py`](profiler.py) | Supervises an OpenAI-compatible model server you pass after `--` (e.g. `mlx-openai-server launch ...`) and exposes a live `/metrics` endpoint (Prometheus) plus `/healthz` and `/api/snapshot`. Walks the server's process tree for footprint; scrapes its `/v1/internal/memory` for the MLX allocator counters (absent if the server doesn't expose it). Optional bearer-token auth via `MLX_PROFILER_METRICS_TOKEN` / `--metrics-token`. For an always-on homelab setup scraped by Prometheus/Grafana; see [`deploy/`](deploy/). Needs `uv sync --extra service`. |
 | [`macstat.py`](macstat.py) | Shared: full macOS memory picture from `vm_stat` + `sysctl` — Activity Monitor breakdown (wired/compressed/app/cached), memory-pressure level, paging counters. |
 | [`mlx_mem.py`](mlx_mem.py) | Import-and-use helper for a custom inference script you write yourself (not `mlx_lm.server`) — same MLX counters, wrapped as a context manager. |
 | `procmem.py` | Shared: process-tree memory reading (RSS vs. `footprint`). |
@@ -29,12 +29,13 @@ python monitor.py --plot -- python -m mlx_lm.server --model mlx-community/Qwen3.
 # Or the convenience wrapper (same thing, forwards flags to mlx_lm.server)
 ./serve.sh --model mlx-community/Qwen3.5-9B-6bit --port 8080
 
-# Always-on: serve the model AND expose Prometheus metrics on :9105
+# Always-on: supervise the model server AND expose Prometheus metrics on :9105
 uv sync --extra service
-uv run profiler.py --model mlx-community/Qwen3.5-9B-6bit --port 8080
+uv run profiler.py -- mlx-openai-server launch --model-path mlx-community/Qwen3.5-9B-6bit --port 8080
 
 # ...with a bearer token required on /metrics and /api/snapshot
-MLX_PROFILER_METRICS_TOKEN=$(openssl rand -hex 32) uv run profiler.py --model ... --port 8080
+MLX_PROFILER_METRICS_TOKEN=$(openssl rand -hex 32) \
+  uv run profiler.py -- mlx-openai-server launch --model-path ... --port 8080
 ```
 
 Needs `pip install psutil` (`matplotlib` too if using `--plot`).
@@ -47,9 +48,10 @@ uv run pytest -q
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same on the homelab ARC runners.
-MLX is Apple-silicon only, so `profiler.py` imports with `mx = None` off a
-Mac and the model-server path is guarded in `main()` — the sampler maths,
-the metric wiring and the FastAPI endpoints are all still covered.
+`profiler.py` no longer imports MLX at all (the model server is the child
+process you pass after `--`), so the sampler maths, the `/v1/internal/memory`
+scrape parsing, the metric wiring and the FastAPI endpoints are all covered
+off Apple Silicon.
 
 ## Design choices and why
 
@@ -59,6 +61,19 @@ write — so the only universally-working approach is watching it from
 outside via `psutil`. `serve_kv.py` and `mlx_mem.py` exist for the cases
 where you *can* get inside the process, but `monitor.py` is the one that
 always works.
+
+**`profiler.py` supervises the server; it doesn't host it.** Earlier it ran
+`mlx_lm.server` in a background thread of its own process so it could read
+`mx.get_active_memory()` directly. `mlx-openai-server` (the server the
+homelab code reviewer uses, for its Qwen 3.5 tool-call parsing) always loads
+the model in a *spawned subprocess* to dodge an MLX Metal command-buffer race
+([ml-explore/mlx#2457](https://github.com/ml-explore/mlx/issues/2457)), so
+in-process counters would read zero. Instead `profiler.py` launches the
+server as a child, walks its whole process tree for the footprint number, and
+scrapes the server's own `/v1/internal/memory` endpoint for the MLX allocator
+counters. If the server doesn't expose that endpoint the `mlx_*_memory_bytes`
+gauges are simply not emitted and `mlx_profiler_mlx_memory_up` reads 0 — the
+footprint-vs-ceiling picture (the whole point) still works.
 
 **`footprint` over plain RSS.** First version used `psutil`'s RSS. Tested
 against a real Qwen3.5-9B run and it was off by roughly 2x from what
