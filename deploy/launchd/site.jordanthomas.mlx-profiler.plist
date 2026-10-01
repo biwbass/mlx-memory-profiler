@@ -46,6 +46,13 @@
         <!-- footprint / vm_stat / sysctl live in /usr/bin and /usr/sbin -->
         <key>PATH</key>
         <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+
+        <!-- Uncomment to require 'Authorization: Bearer <token>' on /metrics and
+             /api/snapshot (/healthz stays open). Set here rather than in
+             ProgramArguments so it doesn't show up in `ps`. Generate with
+             `openssl rand -hex 32`; use the same value in the cluster Secret. -->
+        <!-- <key>MLX_PROFILER_METRICS_TOKEN</key>
+        <string>replace-with-64-hex-chars</string> -->
     </dict>
 
     <key>RunAtLoad</key>

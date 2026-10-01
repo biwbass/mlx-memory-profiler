@@ -20,6 +20,16 @@ spec:
   scrapeInterval: 15s
   scrapeTimeout: 10s
   metricsPath: /metrics
+  # profiler.py started with MLX_PROFILER_METRICS_TOKEN / --metrics-token requires
+  # a bearer token on /metrics. Create the Secret in the monitoring namespace:
+  #   kubectl -n monitoring create secret generic mlx-profiler-metrics-token \
+  #     --from-literal=token="$(cat ~/.mlx-profiler-token)"
+  # then uncomment (drop this block entirely if the endpoint is left open):
+  # authorization:
+  #   type: Bearer
+  #   credentials:
+  #     name: mlx-profiler-metrics-token
+  #     key: token
   staticConfigs:
     - targets:
         # Mac mini LAN address / DNS name + profiler.py --metrics-port
