@@ -32,8 +32,9 @@ jobs:
 
       # MLX is Apple-silicon only and never installs on these arm64 Linux
       # runners -- the same way hailo-detect's CI skips HailoRT. profiler.py
-      # imports with mx=None, so the sampler maths and the FastAPI app are
-      # still exercised here; only the model-server path needs real hardware.
+      # doesn't import MLX at all (the model server is a child process), so the
+      # sampler maths, the metrics scrape and the FastAPI app are all exercised
+      # here; only a live model server needs real hardware.
       - name: Install dependencies (no mlx)
         run: |
           python -m pip install --disable-pip-version-check \

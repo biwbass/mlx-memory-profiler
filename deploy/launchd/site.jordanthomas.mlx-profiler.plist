@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Runs profiler.py (mlx_lm.server + /metrics) as a login agent on the Mac mini.
+  Runs profiler.py (supervises mlx-openai-server, exposes /metrics) as a login
+  agent on the Mac mini.
 
   Install:
     cp deploy/launchd/site.jordanthomas.mlx-profiler.plist ~/Library/LaunchAgents/
-    # edit the --model line below for the model you want served
+    # edit the --model-path line below for the model you want served
     launchctl load  ~/Library/LaunchAgents/site.jordanthomas.mlx-profiler.plist
     launchctl start site.jordanthomas.mlx-profiler
 
@@ -29,8 +30,11 @@
         <string>9105</string>
         <string>--sample-interval</string>
         <string>2</string>
-        <!-- everything below is passed straight through to mlx_lm.server -->
-        <string>--model</string>
+        <!-- everything after `--` is the model server profiler.py supervises -->
+        <string>--</string>
+        <string>mlx-openai-server</string>
+        <string>launch</string>
+        <string>--model-path</string>
         <string>mlx-community/Qwen3.5-9B-6bit</string>
         <string>--host</string>
         <string>0.0.0.0</string>
@@ -43,9 +47,10 @@
 
     <key>EnvironmentVariables</key>
     <dict>
-        <!-- footprint / vm_stat / sysctl live in /usr/bin and /usr/sbin -->
+        <!-- .venv/bin so `mlx-openai-server` resolves; footprint / vm_stat /
+             sysctl live in /usr/bin and /usr/sbin -->
         <key>PATH</key>
-        <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <string>/Users/jordanthomas/Developer/homelab/mlx-memory-profiler/.venv/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
 
         <!-- Uncomment to require 'Authorization: Bearer <token>' on /metrics and
              /api/snapshot (/healthz stays open). Set here rather than in
